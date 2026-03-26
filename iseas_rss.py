@@ -1,270 +1,194 @@
-import requests, os, json, time, re
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import json
+import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin
-from datetime import datetime, timezone
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from feedgen.feed import FeedGenerator
 from slugify import slugify
-from newspaper import Article
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 
-BASE = "https://www.iseas.edu.sg/library/blog/daily-news-alerts/"
+BASE_URL = "https://www.iseas.edu.sg/library/blog/daily-news-alerts/"
 HEADERS = {"User-Agent": "Mozilla/5.0"}
-CACHE = "rss/seen_links.json"
+RSS_DIR = "rss"
+JSON_FILE = "data.json"
+MAX_ARTICLES = 100   # giới hạn số bài crawl mỗi run
+MAX_THREADS = 5
 
-os.makedirs("rss", exist_ok=True)
+CATEGORIES = [
+    "vietnam",
+    "indonesia",
+    "asean",
+    "thailand",
+    "philippines",
+    "malaysia",
+    "singapore",
+    "myanmar",
+    "laos",
+]
 
-def load_seen():
-    if os.path.exists(CACHE):
-        return set(json.load(open(CACHE)))
-    return set()
+# ----------------------
+# HELPERS
+# ----------------------
+def get_links():
+    """
+    Crawl các link tin theo ngày, gom tất cả các bài
+    """
+    links = []
+    for i in range(30):  # crawl 30 ngày gần nhất, tùy chỉnh
+        date_str = (datetime.now() - timedelta(days=i)).strftime("%y%m%d")
+        url = f"{BASE_URL}{date_str}"
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=5)
+            soup = BeautifulSoup(r.text, "html.parser")
+            for a in soup.select("a"):
+                href = a.get("href")
+                if href and "/library/blog/daily-news-alerts/" in href:
+                    links.append(href)
+        except:
+            continue
+    return list(set(links))[:MAX_ARTICLES]
 
-def save_seen(seen):
-    json.dump(list(seen), open(CACHE, "w"))
 
-def clean(text):
-    return text.replace("\n", " ").strip()
+def get_fast_content(url):
+    """
+    Lấy nhanh nội dung bài, chỉ text, bỏ hình
+    """
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=5)
+        soup = BeautifulSoup(r.text, "html.parser")
+        texts = []
+        for p in soup.find_all("p"):
+            t = p.get_text(strip=True)
+            if len(t) > 50:
+                texts.append(t)
+            if len(" ".join(texts)) > 1500:
+                break
+        return "\n".join(texts)
+    except:
+        return ""
 
-def normalize(cat):
-    mapping = {
-        "Viet Nam": "Vietnam",
-        "U.S.": "United States",
-        "US": "United States"
-    }
-    return mapping.get(cat.strip(), cat.strip())
 
-# ===== SUMMARY =====
-def get_summary(url):
+def parse_article(url):
+    """
+    Lấy metadata cơ bản + content nhanh
+    """
     try:
         r = requests.get(url, headers=HEADERS, timeout=5)
         soup = BeautifulSoup(r.text, "html.parser")
 
-        meta = soup.find("meta", attrs={"name": "description"})
-        if meta and meta.get("content"):
-            return meta.get("content").strip()
+        title = soup.find("h1")
+        title = title.get_text(strip=True) if title else "No Title"
 
-        p = soup.find("p")
-        if p:
-            return p.get_text(strip=True)
+        date = soup.find("time")
+        if date and date.has_attr("datetime"):
+            dt = datetime.fromisoformat(date["datetime"])
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = datetime.now(timezone.utc)
+
+        # content
+        content = get_fast_content(url)
+        return {
+            "title": title,
+            "link": url,
+            "date": dt,
+            "content": content,
+        }
     except:
-        pass
-    return ""
+        return None
 
-# ===== FULL TEXT =====
-def get_full_content(url):
-    try:
-        article = Article(url)
-        article.download()
-        article.parse()
 
-        text = article.text
-        text = re.sub(r"\n+", "\n", text).strip()
+# ----------------------
+# BUILD RSS
+# ----------------------
+def build(data):
+    if not os.path.exists(RSS_DIR):
+        os.makedirs(RSS_DIR)
 
-        if len(text) > 4000:
-            text = text[:4000] + "..."
-
-        return text
-    except:
-        return ""
-
-# ===== GET LINKS =====
-def get_links(seen):
-    links = []
-
-    for p in range(1, 100):
-        url = BASE if p == 1 else f"{BASE}page/{p}/"
-        r = requests.get(url, headers=HEADERS)
-
-        if r.status_code != 200:
-            break
-
-        soup = BeautifulSoup(r.text, "html.parser")
-        stop = False
-
-        for a in soup.select("h2 a"):
-            href = a.get("href")
-            if not href:
-                continue
-
-            full = urljoin(BASE, href)
-
-            if full in seen:
-                stop = True
-                break
-
-            links.append(full)
-
-        if stop:
-            break
-
-        time.sleep(0.3)
-
-    return list(set(links))
-
-# ===== PARSE =====
-def parse(url):
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=10)
-        soup = BeautifulSoup(r.text, "html.parser")
-
-        content = soup.select_one(".entry-content")
-        if not content:
-            return {}
-
-        dstr = url.rstrip("/").split("/")[-1]
-        try:
-            d = datetime.strptime(dstr, "%y%m%d").replace(tzinfo=timezone.utc)
-        except:
-            d = datetime.now(timezone.utc)
-
-        data = {}
-        current = None
-
-        for el in content.find_all(["h3", "h4", "p", "ul"]):
-
-            if el.name in ["h3", "h4"]:
-                current = normalize(el.get_text())
-                data.setdefault(current, [])
-                continue
-
-            if current:
-                for a in el.find_all("a", href=True):
-                    link = urljoin(url, a["href"])
-                    title = clean(a.get_text())
-
-                    if not title or not link:
-                        continue
-
-                    summary = get_summary(link)
-                    full_text = get_full_content(link)
-
-                    data[current].append({
-                        "title": title,
-                        "link": link,
-                        "summary": summary,
-                        "content": full_text,
-                        "date": d
-                    })
-
-        return data
-
-    except:
-        return {}
-
-# ===== CRAWL =====
-def crawl(links):
-    all_data = {}
-
-    with ThreadPoolExecutor(max_workers=10) as ex:
-        futures = [ex.submit(parse, l) for l in links]
-
-        for f in as_completed(futures):
-            res = f.result()
-
-            for k, v in res.items():
-                all_data.setdefault(k, []).extend(v)
-
-    return all_data
-
-# ===== BUILD RSS =====
-def build(all_data):
-
-    # --- CATEGORY (SUMMARY) ---
-    for cat, items in all_data.items():
+    # 1. RSS theo từng category
+    for cat, articles in data.items():
         fg = FeedGenerator()
-        fg.title(f"ISEAS - {cat}")
-        fg.link(href=BASE)
-        fg.description(f"News about {cat}")
-
-        seen = set()
-
-        for it in items:
-            title = it.get("title","").strip()
-            link = it.get("link","").strip()
-            summary = it.get("summary","")
-
-            if not title or not link or link in seen:
+        fg.title(f"ISEAS Daily News - {cat}")
+        fg.link(href=BASE_URL)
+        fg.description(f"Daily news alerts for {cat}")
+        for it in articles:
+            if not it:
                 continue
-
-            seen.add(link)
-
             e = fg.add_entry()
-            e.title(title)
-            e.link(href=link)
+            e.title(it["title"])
+            e.link(href=it["link"])
             e.pubDate(it["date"])
-            e.description(summary if summary else title)
+            e.description(it["content"])
+        fg.rss_file(f"{RSS_DIR}/{slugify(cat)}.xml")
 
-        fg.rss_file(f"rss/{slugify(cat)}.xml")
-
-    # --- ALL BY CATEGORY (SUMMARY) ---
-    fg = FeedGenerator()
-    fg.title("ISEAS - All by Category")
-    fg.link(href=BASE)
-    fg.description("All grouped")
-
-    for cat, items in all_data.items():
-        for it in items:
-            title = it.get("title","").strip()
-            link = it.get("link","").strip()
-            summary = it.get("summary","")
-
-            if not title or not link:
+    # 2. RSS gom tất cả theo category
+    fg2 = FeedGenerator()
+    fg2.title("ISEAS Daily News - All by Category")
+    fg2.link(href=BASE_URL)
+    fg2.description("All categories combined, sorted by category")
+    for cat, articles in data.items():
+        for it in articles:
+            if not it:
                 continue
-
-            e = fg.add_entry()
-            e.title(f"[{cat}] {title}")
-            e.link(href=link)
+            e = fg2.add_entry()
+            e.title(f"[{cat}] {it['title']}")
+            e.link(href=it["link"])
             e.pubDate(it["date"])
-            e.description(summary if summary else title)
+            e.description(it["content"])
+    fg2.rss_file(f"{RSS_DIR}/all_by_category.xml")
 
-    fg.rss_file("rss/all_by_category.xml")
+    # 3. RSS gom tất cả theo date
+    all_articles = []
+    for cat, articles in data.items():
+        all_articles.extend(articles)
+    all_articles.sort(key=lambda x: x["date"], reverse=True)
 
-    # --- ALL BY DATE (FULL TEXT) ---
-    fg = FeedGenerator()
-    fg.title("ISEAS - All by Date")
-    fg.link(href=BASE)
-    fg.description("Full text feed")
-
-    all_items = []
-    for v in all_data.values():
-        all_items.extend(v)
-
-    all_items.sort(key=lambda x: x["date"], reverse=True)
-
-    seen = set()
-
-    for it in all_items:
-        title = it.get("title","").strip()
-        link = it.get("link","").strip()
-        content = it.get("content","")
-
-        if not title or not link or link in seen:
+    fg3 = FeedGenerator()
+    fg3.title("ISEAS Daily News - All by Date")
+    fg3.link(href=BASE_URL)
+    fg3.description("All categories combined, sorted by date")
+    for it in all_articles:
+        if not it:
             continue
-
-        seen.add(link)
-
-        e = fg.add_entry()
-        e.title(title)
-        e.link(href=link)
+        e = fg3.add_entry()
+        e.title(f"[{it['title']}]")
+        e.link(href=it["link"])
         e.pubDate(it["date"])
+        e.description(it["content"])
+    fg3.rss_file(f"{RSS_DIR}/all_by_date.xml")
 
-        text = f"{title}\n\n{content}" if content else title
-        e.description(text)
 
-    fg.rss_file("rss/all_by_date.xml")
-
-# ===== MAIN =====
+# ----------------------
+# MAIN
+# ----------------------
 def main():
-    seen = load_seen()
-    links = get_links(seen)
-    print("New:", len(links))
+    links = get_links()
 
-    data = crawl(links)
+    data = {cat: [] for cat in CATEGORIES}
+
+    with ThreadPoolExecutor(max_workers=MAX_THREADS) as ex:
+        futures = [ex.submit(parse_article, url) for url in links]
+        for f in futures:
+            res = f.result()
+            if not res:
+                continue
+            # assign category
+            for cat in CATEGORIES:
+                if cat in res["link"]:
+                    data[cat].append(res)
+                    break
+
+    # build RSS
     build(data)
 
-    seen.update(links)
-    save_seen(seen)
+    # save json
+    with open(JSON_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, default=str, ensure_ascii=False)
 
-    print("DONE")
 
 if __name__ == "__main__":
+    from datetime import timedelta
     main()
